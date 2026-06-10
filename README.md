@@ -1,85 +1,107 @@
-# Prediction Market Microstructure & Probabilistic Calibration
+# Prediction market calibration research
 
-Research platform for retail prediction markets (Kalshi), built around one discipline:
-**no model trades real money until it demonstrably beats the market's own probabilities
-on a logged, out-of-sample record.**
+This is my research platform for trading prediction markets, mainly Kalshi for now.
+It exists because of a rule I keep having to relearn: the market is sharper than my
+models until proven otherwise, and "proven" means out of sample, on settled outcomes,
+not on backtests I can fool myself with.
 
-Three pillars:
+Prediction markets quote probabilities. If you can produce better-calibrated
+probabilities than the market in some niche, you have an edge. Plenty of people
+believe their model; very few measure whether its probabilities actually beat the
+prices. So the centerpiece of this repo is not a trading bot. It is a journal that
+records every probability my models emit next to the market price at that moment,
+waits for markets to settle, and scores both sides. The standing rule: no real money
+until the journal shows the model beating the market on Brier score over at least
+two weeks of resolved markets. As of day one, it does not.
 
-1. **Data asset** — a continuously-running snapshotter builds a tick-history of quotes and
-   settled outcomes across every real Kalshi market (~7.6k events / ~65k markets), producing a
-   labeled `(price, time-to-close, category) → outcome` dataset for calibration research.
-2. **Probabilistic forecasting** — a weather model converts multi-model ensemble forecasts
-   (122 members across GFS/ECMWF/ICON) into bracket probabilities for Kalshi's daily
-   high-temperature markets, with per-station bias correction and skill weighting fitted
-   against the official climate record.
-3. **Strategy + honest evaluation** — a fee-aware basket-arbitrage scanner and an edge
-   journal that scores every model claim against what actually settled (Brier score vs.
-   the market) before any capital is risked.
+## What's in here
 
-## Architecture
+- `snapshot.py` collects the data. A daemon sweeps the full Kalshi universe every two
+  hours (about 7,600 events and 65,000 markets) and requotes the ~4,000 markets that
+  are near close or actively trading every five minutes, into SQLite. Settlements get
+  recorded as they finalize, which is what turns price history into labeled training
+  data. Rows are only written when a quote actually changes.
+- `kalshi.py` is a small public-data client. The working API host is
+  `api.elections.kalshi.com` (the documented `api.kalshi.com` does not resolve), and
+  the fee formula is `ceil(0.07 * P * (1-P) * 100)` cents, rounded up. That rounding
+  matters more than it looks: a 5 cent contract pays a 1 cent fee, a 20% tax.
+- `weather.py` and `calibrate.py` are the forecasting side. Kalshi's daily
+  high-temperature markets settle on the NWS climate report for one specific station,
+  so the model pulls free ensemble forecasts (122 members across GFS, ECMWF, and ICON
+  via Open-Meteo) and calibrates them per station against the official ACIS climate
+  record: per-model bias and error measured on exactly the quantity being predicted.
+- `scan_weather.py` turns calibrated members into bracket probabilities (weighted
+  kernel density, skill-weighted by model, clamped to the station's observed running
+  max on same-day scans) and compares them to live market prices, fee-adjusted.
+- `arb_scan.py` looks for risk-free baskets on mutually-exclusive events.
+- `journal.py` is the gate described above. `score` joins logged predictions to
+  settled outcomes and prints the verdict.
+- `tests/` covers the math that would lose money silently if wrong: fees, bracket
+  parsing, basket arithmetic, scoring. 21 tests, no network.
 
-| Component | What it does |
-|---|---|
-| [`snapshot.py`](snapshot.py) | Daemon: 2h full-universe sweeps + 5min hot-tier re-quoting (~4k markets near close/active) + settlement capture, into SQLite (`data/ledger.db`). Change-deduped rows; rate-limit aware. |
-| [`kalshi.py`](kalshi.py) | Public market-data client (correct host, orderbook→bid/ask, exact `ceil`-rounded fee formula). |
-| [`weather.py`](weather.py) | Open-Meteo ensemble client → per-member daily-high distributions, per model; NWS station running-max (same-day floor). |
-| [`calibrate.py`](calibrate.py) | Fits per-station, per-model bias + MAE from day-ahead forecast errors vs. the official ACIS climate record, with a walk-forward out-of-sample check. |
-| [`scan_weather.py`](scan_weather.py) | Bracket probabilities (weighted KDE over bias-corrected members + observed floor) vs. live market prices, fee-adjusted, journaled. |
-| [`arb_scan.py`](arb_scan.py) | Mutually-exclusive basket arbitrage: risk-free NO-baskets ranked first; YES-baskets auto-screened by market-implied "other" probability (non-exhaustiveness traps). |
-| [`journal.py`](journal.py) | The gate: logs every scan's full probability surface; `score` computes model-vs-market Brier + flagged-trade paper PnL on resolved markets. |
+## What day one taught me
 
-## Quickstart
+I scanned the NYC high-temperature market on June 9, 2026 with the naive version of
+the model (pool all ensemble members, read off bracket probabilities). It put 39% on
+the 82-83°F bracket. The market priced that bracket at 4 cents and split its money
+between 78-79 and 80-81. The observed high was 79°F. The market had roughly 50% on
+the winning bracket; my model had 22%, and its favorite bracket lost.
+
+The post-mortem was more useful than a win would have been. The three weather models
+flatly disagreed that day (GFS and ECMWF said 82-83, ICON said 78), and pooling them
+produced a confident-looking blend of two opinions, one of which was wrong. Fitting
+each model against the official Central Park record explained the rest: ICON's
+day-ahead error at that station is 1.49°F walk-forward MAE, versus roughly 2.17°F for
+GFS and ECMWF. The market already knew which model to trust. My calibration learned
+it one day late, which is exactly the kind of lesson the journal is designed to
+catch before it costs anything.
+
+The arbitrage side got its own reality check. A full scan of 3,235 mutually-exclusive
+events found zero risk-free NO-baskets clearing fees. It did find 27 YES-baskets
+showing 80 to 94 cents of apparent profit, every one of which was a trap: markets
+like Louisiana primary "nominee" contracts where the listed candidates sum to a few
+cents because the likely outcome is that no listed candidate qualifies. The prices
+themselves tell you this (100 minus the sum of asks is the market's estimate of the
+unlisted outcome), so the scanner now computes that and suppresses the traps instead
+of reporting them as opportunities.
+
+## Running it
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python snapshot.py run &        # start the data spine (long-running)
-.venv/bin/python calibrate.py NY          # fit weather calibration (~60d history)
-.venv/bin/python scan_weather.py NY --log # bracket probabilities vs market, journaled
-.venv/bin/python arb_scan.py              # risk-free basket scan (ledger + live verify)
-.venv/bin/python journal.py score         # model vs market on settled rows
-.venv/bin/python -m pytest tests/ -q      # 21 tests, no network
+.venv/bin/python snapshot.py run &         # data daemon, leave running
+.venv/bin/python calibrate.py NY           # fit weather calibration (~60 days)
+.venv/bin/python scan_weather.py NY --log  # bracket probabilities vs market, journaled
+.venv/bin/python arb_scan.py               # basket scan, ledger + live verification
+.venv/bin/python journal.py score          # model vs market on settled rows
+.venv/bin/python -m pytest tests/ -q
 ```
 
-## Day-one findings (kept honest)
+## Things I do not trust yet
 
-- **The market beat the raw model.** On 2026-06-09 the raw pooled ensemble put 39% on the
-  82–83°F bracket (market: 4%) and 22% on the winner. Observed high: **79°F** — the bracket
-  the market had at ~50%. Verdict: market 1, raw model 0.
-- **Why: model skill is station-specific.** Calibration against the official Central Park
-  record shows ICON at **1.49°F** walk-forward MAE vs ~2.17 for GFS/ECMWF — the market had
-  already internalized what the naive pooled ensemble ignores. The skill-weighted,
-  bias-corrected blend (1.54°F) roughly matches the best single model out-of-sample;
-  its value is robustness and distribution shape, not point accuracy.
-- **Risk-free arbitrage is mostly competed flat.** A full scan of 3,235 mutually-exclusive
-  events found zero NO-baskets clearing fees; 27 seductive YES-baskets were auto-rejected
-  because their own prices implied a >10% unlisted outcome (e.g. jungle-primary "nominee"
-  markets where no listed candidate is likely to qualify).
-- **Fees dominate small edges.** Kalshi's taker fee `ceil(0.07·P·(1−P)·100)¢` rounds *up*:
-  a 5¢ contract pays a 1¢ fee — a 20% tax. Sub-15¢ "edges" are usually fee illusions.
+- The calibration is fitted on day-ahead forecast errors but the scanner also runs
+  same-day, where true uncertainty is tighter. Until calibration is lead-time
+  specific, same-day disagreements with the market are suspect, and the model's
+  large flagged "edges" should be read as model warnings.
+- Settlement pays on what a named source reports, not on what happened. Disputed
+  Kalshi markets have settled at last-traded price under rule 6.3(c). Basket profits
+  are risk-free with respect to outcomes, not with respect to settlement rules.
+- Displayed prices are not fillable size. The scanner walks order books for its top
+  candidates, but thin books move when touched.
+- 51 evaluation days of weather calibration is a small sample. The model-vs-market
+  question gets answered by the journal, slowly, the only way it can be.
 
-## Methodology notes
-
-- **Settlement is a proxy, not the event.** Contracts pay on a named source's report
-  (NWS climate report, AP/league feeds), and disputed markets can settle off the rulebook's
-  edge cases — basket "min profit" is risk-free w.r.t. outcomes, not w.r.t. settlement rules.
-- **Bias correction is measured on the deliverable.** Day-ahead forecast errors are computed
-  against the same official record the contracts settle on, so the fitted bias absorbs model
-  bias, grid-vs-station representativeness, and hourly-sampling error in one term.
-- **Known gap:** calibration is fitted at day-ahead lead but also applied same-day, where true
-  uncertainty is tighter — lead-time-specific calibration is the next refinement.
-
-## Status / roadmap
+## Roadmap
 
 - [x] Data spine, weather calibration v1, basket scanner, edge journal, tests
-- [ ] 2+ weeks of journal data → first model-vs-market Brier verdict
-- [ ] Lead-time-specific calibration + intraday METAR assimilation
-- [ ] Calibration study across categories (favorite-longshot / underconfidence)
-- [ ] Cross-venue divergence half-life measurement (Polymarket US)
+- [ ] Two weeks of journal data, then the first model-vs-market verdict
+- [ ] Lead-time-specific calibration and intraday observation assimilation
+- [ ] Calibration study across market categories from the accumulated ledger
+- [ ] Cross-venue divergence measurement against Polymarket US
 
-## Data sources & terms
+## Data sources
 
-[Open-Meteo](https://open-meteo.com/) (CC-BY-4.0; non-commercial tier) · 
-[ACIS / NOAA RCCs](https://www.rcc-acis.org/) · [NWS API](https://api.weather.gov/) · 
-Kalshi public market-data API. Personal research; not financial advice. Trading involves
-risk of loss; respect each venue's terms of service.
+[Open-Meteo](https://open-meteo.com/) (CC-BY-4.0, non-commercial tier),
+[ACIS](https://www.rcc-acis.org/) for official station climate records,
+the [NWS API](https://api.weather.gov/) for live observations, and Kalshi's public
+market-data API. Personal research, not financial advice. Trading risks loss.
