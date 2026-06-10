@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+*.log
+.DS_Store
+strategies_ranked.json
